@@ -1,14 +1,17 @@
+from llmware.models import ModelCatalog
+import os, time, re
+import tqdm
 import faiss
-import time
-import numpy as np
-from tqdm import tqdm
-import lamini
-import re, os
 import pickle
+import numpy as np
+from importlib import util
 
-lamini.api_key = "<API KEY>"
+from transformers import BertModel, BertTokenizer
+import torch
 
-class DefaultChunker:
+os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
+
+class Chunker:
     def __init__(self, chunk_size=512, step_size=256):
         self.chunk_size = chunk_size
         self.step_size = step_size
@@ -19,8 +22,45 @@ class DefaultChunker:
                 max_size = min(self.chunk_size, len(text) - i)
                 yield text[i:i+max_size]
 
+class ContextAwareChunker():
+    def __init__(self, chunk_size=512):
+        self.chunk_size = chunk_size
+
+    def get_chunks(self, data):
+        for text in data:
+            sentences = re.split(r'(?!.)\s+', text)
+
+            chunk = ""
+            for sentence in sentences:
+                if len(chunk) + len(sentence) > self.chunk_size:
+                    yield chunk
+                    chunk = sentence
+                else:
+                    chunk += " " + sentence
+            if chunk:
+                yield chunk
+
+
+class TextEmbedder:
+    def __init__(self, model_name="bert-base-uncased"):
+        # Load the pre-trained BERT model and tokenizer
+        self.tokenizer = BertTokenizer.from_pretrained(model_name)
+        self.model = BertModel.from_pretrained(model_name)
+        self.model.eval()
+
+    def embed(self, text):
+        # Tokenize the input text and convert it to tensor format
+        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        
+        # Get the output embeddings from BERT
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+
+        return outputs.last_hidden_state[:, 0, :].squeeze()
+
+
 class DirectoryLoader:
-    def __init__(self, directory, batch_size=512, chunker=DefaultChunker()):
+    def __init__(self, directory, batch_size=512, chunker=ContextAwareChunker()):
         self.directory = os.path.join(os.getcwd(), directory)
         self.chunker = chunker
         self.batch_size = batch_size
@@ -38,7 +78,7 @@ class DirectoryLoader:
         chunks = []
         for chunk in self.get_chunks():
             chunks.append(chunk)
-            if len(chunks) == self.batch_size:
+            if len(chunks) >= self.batch_size:
                 yield chunks
                 chunks = []
 
@@ -48,11 +88,12 @@ class DirectoryLoader:
     def __iter__(self):
         return self.get_chunk_batches()
 
-class LaminiIndex:
-    def __init__(self, loader):
-        self.loader = loader
+class Indexer:
+    def __init__(self):
+        self.loader = DirectoryLoader("data2")
         self.index = None
-        self.index_file = "index.pkl" 
+        self.index_file = "index.pkl"
+        self.embedder = TextEmbedder()
         if self._index_exists():
             self.load_index()
         else:
@@ -70,7 +111,8 @@ class LaminiIndex:
     def build_index(self):
         self.content_chunks = []
         self.index = None
-        for chunk_batch in tqdm(self.loader):
+        #for chunk_batch in tqdm(self.loader):
+        for chunk_batch in self.loader:
             embeddings = self.get_embeddings(chunk_batch)
             if self.index is None:
                 self.index = faiss.IndexFlatL2(len(embeddings[0]))
@@ -89,24 +131,23 @@ class LaminiIndex:
             self.index, self.content_chunks = pickle.load(f)
         print("Index and chunks loaded.")
 
-    def get_embeddings(self, examples):
-        ebd = lamini.api.embedding.Embedding()
-        embeddings = ebd.generate(examples)
-        result = np.array([embedding[0] for embedding in embeddings])
-        return result
-
+    def get_embeddings(self, text):
+        embedding = self.embedder.embed(text)
+        if embedding.dim() == 0:
+            embedding = embedding.unsqueeze(0)
+        return embedding
 
     def query(self, query, k=5):
-        embedding = self.get_embeddings([query])[0]
-        embedding_array = np.array([embedding])
+        embedding = self.get_embeddings([query])
+        embedding_array = np.array(embedding).reshape(1, -1)
         _, indices = self.index.search(embedding_array, k)
         return [self.content_chunks[i] for i in indices[0]]
 
 class QueryEngine:
-    def __init__(self, index, k=5):
+    def __init__(self, index, k=3):
         self.index = index
         self.k = k
-        self.model = lamini.Lamini(model_name="meta-llama/Meta-Llama-3.1-8B-Instruct")
+        self.model = ModelCatalog().load_model("phi-3-onnx", max_output=500)
 
     def preprocess_query(self, query):
         return query.lower().strip()
@@ -115,34 +156,37 @@ class QueryEngine:
         query = self.preprocess_query(question)
         most_similar = self.index.query(query, k=self.k)
         prompt = "\n".join(reversed(most_similar)) + "\n\n" + question
-        return self.model.generate(f"<s>[INST]{prompt}[/INST]")
+        tokens = []
+        streamed_response = self.model.stream(prompt)
+        for streamed_token in streamed_response:
+            tokens.append(streamed_token)
+        text_out = ''.join(tokens)
+        return text_out
+
 
 class RetrievalAugmentedRunner:
-    def __init__(self, dir, k=5):
+    def __init__(self, k=5):
         self.k = k
-        self.loader = DirectoryLoader(dir)
 
     def train(self):
-        self.index = LaminiIndex(self.loader)
+        self.index = Indexer()
 
     def __call__(self, query):
         query_engine = QueryEngine(self.index, k=self.k)
         return query_engine.answer_question(query)
 
-def main():
-    model = RetrievalAugmentedRunner(dir="data")
+if __name__ == "__main__":
+
+    model = RetrievalAugmentedRunner()
     start = time.time()
     model.train()
     print("Index built in:", round(time.time() - start, 2), "seconds")
 
-    while True:
-        question = input("\nEnter your question: ")
-        if not question.strip():
-            print("Exiting...")
-            break
-        answer = model(question)
-        text = str(answer)
-        clean_text = re.sub(r'\[INST\]s\[/INST\]', '', text)
-        print(f"\nQuestion: {question}\nAnswer: {clean_text}\n")
-
-main()
+    #while True:
+    question = input("\nEnter your question: ")
+    # if not question.strip():
+    #     print("Exiting...")
+    #     break
+    answer = model(question)
+    text = str(answer).split("<human>")[0].strip()
+    print(f"\nQuestion: {question}\nAnswer: {text}\n")
