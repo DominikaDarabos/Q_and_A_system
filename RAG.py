@@ -9,6 +9,10 @@ from importlib import util
 from transformers import BertModel, BertTokenizer
 import torch
 
+DATA_DIRECTORY = "rag_data"
+LLM_MODEL_NAME = "phi-3-onnx"
+NUM_MODEL_MAX_OUTPUT_TOKEN = 100
+K_KNN_DOCUMENTS = 3
 
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 
@@ -156,7 +160,6 @@ class Indexer:
             self.save_index()
 
     def _index_exists(self):
-        """Check if the index file already exists."""
         try:
             with open(self.index_file, 'rb') as f:
                 return True
@@ -164,9 +167,9 @@ class Indexer:
             return False
 
     def build_index(self):
+        print("Start building index...")
         self.content_chunks = []
         self.index = None
-        #for chunk_batch in tqdm(self.loader):
         for chunk_batch in self.loader:
             embeddings = self.get_embeddings(chunk_batch)
             if self.index is None:
@@ -175,16 +178,14 @@ class Indexer:
             self.content_chunks.extend(chunk_batch)
 
     def save_index(self):
-        """Save the built index and content chunks to a file."""
         with open(self.index_file, 'wb') as f:
             pickle.dump((self.index, self.content_chunks), f)
-        print("Index and chunks saved.")
+        print("Index and text chunks saved.")
 
     def load_index(self):
-        """Load the index and content chunks from the file."""
         with open(self.index_file, 'rb') as f:
             self.index, self.content_chunks = pickle.load(f)
-        print("Index and chunks loaded.")
+        print("Index and text chunks loaded.")
 
     def get_embeddings(self, text: str):
         embedding = self.embedder.create_embedding(text)
@@ -211,10 +212,9 @@ class RAGengine:
         answer_question(question): Retrieves context, generates an answer, and returns it.
         __call__(query): Shortcut for calling answer_question.
     """
-    def __init__(self, k=3):
+    def __init__(self):
         self.index = Indexer()
-        self.k = k
-        self.model = ModelCatalog().load_model("phi-3-onnx", max_output=500)
+        self.model = ModelCatalog().load_model(LLM_MODEL_NAME, max_output=NUM_MODEL_MAX_OUTPUT_TOKEN)
         #self.model = ModelCatalog().load_model("llmware/bling-tiny-llama-v0", max_output=500)
         #self.model = ModelCatalog().load_model("bartowski/Meta-Llama-3-8B-Instruct-GGUF", max_output=500)
 
@@ -223,7 +223,7 @@ class RAGengine:
 
     def answer_question(self, question):
         query = self.preprocess_query(question)
-        most_similar = self.index.query(query, k=self.k)
+        most_similar = self.index.query(query, k=K_KNN_DOCUMENTS)
         prompt = "\n".join(reversed(most_similar)) + "\n\n" + question
         tokens = []
         streamed_response = self.model.stream(prompt)
@@ -239,13 +239,11 @@ if __name__ == "__main__":
 
     model = RAGengine()
     start = time.time()
-    print("Index built in:", round(time.time() - start, 2), "seconds")
+    print("Index built or loaded in:", round(time.time() - start, 2), "seconds")
 
-    #while True:
     question = input("\nEnter your question: ")
-    # if not question.strip():
-    #     print("Exiting...")
-    #     break
+    start = time.time()
     answer = model(question)
     text = str(answer).split("<human>")[0].strip()
     print(f"\nQuestion: {question}\nAnswer: {text}\n")
+    print("Text generated in:", round(time.time() - start, 2), "seconds")
