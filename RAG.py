@@ -12,7 +12,8 @@ import torch
 DATA_DIRECTORY = "rag_data"
 LLM_MODEL_NAME = "phi-3-onnx"
 NUM_MODEL_MAX_OUTPUT_TOKEN = 100
-K_KNN_DOCUMENTS = 3
+K_KNN_CONTENT = 3
+REGENERATE_INDEX = False
 
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 
@@ -103,12 +104,12 @@ class DataLoader:
         __iter__(): Allows iteration over chunk batches.
     """
     def __init__(self, directory: str, batch_size: int = 512, chunker = Chunker()):
-        self.directory = os.path.join(os.getcwd(), directory)
+        self.directory = directory
         self.chunker = chunker
         self.batch_size = batch_size
 
     def load(self):
-        for root, dirs, files in os.walk(self.directory):
+        for root, _, files in os.walk(self.directory):
             for file in files:
                 with open(os.path.join(root, file), "r", encoding="utf-8") as f:
                     yield f.read()
@@ -153,7 +154,7 @@ class Indexer:
         self.index = None
         self.index_file = "index.pkl"
         self.embedder = TextEmbedder()
-        if self._index_exists():
+        if self._index_exists() and not REGENERATE_INDEX:
             self.load_index()
         else:
             self.build_index()
@@ -193,8 +194,8 @@ class Indexer:
             embedding = embedding.unsqueeze(0)
         return embedding
 
-    def query(self, query: str, k: int = 5):
-        embedding = self.get_embeddings([query])
+    def query(self, question: str, k: int = 5):
+        embedding = self.get_embeddings([question])
         embedding_array = np.array(embedding).reshape(1, -1)
         _, indices = self.index.search(embedding_array, k)
         return [self.content_chunks[i] for i in indices[0]]
@@ -223,7 +224,7 @@ class RAGengine:
 
     def answer_question(self, question):
         query = self.preprocess_query(question)
-        most_similar = self.index.query(query, k=K_KNN_DOCUMENTS)
+        most_similar = self.index.query(query, k=K_KNN_CONTENT)
         prompt = "\n".join(reversed(most_similar)) + "\n\n" + question
         tokens = []
         streamed_response = self.model.stream(prompt)

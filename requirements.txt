@@ -1,0 +1,5 @@
+transformers
+faiss-gpu
+llmware
+datasets
+onnxruntime_genai
