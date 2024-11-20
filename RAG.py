@@ -52,7 +52,7 @@ class ContextAwareChunker():
 
     def get_chunks(self, data):
         for text in data:
-            sentences = re.split(r'(?!.)\s+', text)
+            sentences = re.split(r'([?!.,-])', text)
 
             chunk = ""
             for sentence in sentences:
